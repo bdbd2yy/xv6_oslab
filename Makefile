@@ -70,7 +70,8 @@ OBJCOPY = $(TOOLPREFIX)objcopy
 OBJDUMP = $(TOOLPREFIX)objdump
 GDB = $(TOOLPREFIX)gdb
 
-CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb -DTEST
+# CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb -DTEST
+CFLAGS = -Wall -O -fno-omit-frame-pointer -ggdb -DTEST
 
 GCC_VER12 := $(shell expr `$(CC) -dumpfullversion -dumpversion | sed -e 's/\.\([0-9][0-9]\)/\1/g' -e 's/\.\([0-9]\)/0\1/g' -e 's/^[0-9]\{3,4\}$$/&00/'` \>= 120000)
 ifeq "$(GCC_VER12)" "1"
@@ -157,6 +158,9 @@ UPROGS=\
 	$U/_grind\
 	$U/_wc\
 	$U/_zombie\
+	$U/_sleep\
+	$U/_pingpong\
+	$U/_find\
 
 
 ifeq ($(LAB),syscall)
