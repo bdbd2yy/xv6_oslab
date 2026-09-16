@@ -16,13 +16,7 @@ int nextpid = 1;
 struct spinlock pid_lock;
 
 // enum procstate { UNUSED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
-const char *proc_stat[] = {
-  "unused",
-  "sleep",
-  "runble",
-  "run",
-  "zombie"
-};
+const char *proc_stat[] = {"unused", "sleep", "runble", "run", "zombie"};
 
 extern void forkret(void);
 static void wakeup1(struct proc *chan);
@@ -291,7 +285,8 @@ void reparent(struct proc *p) {
       // pp->parent can't change between the check and the acquire()
       // because only the parent changes it, and we're the parent.
       acquire(&pp->lock);
-      exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n", p->pid, cnt, pp->pid, pp->name, proc_stat[pp->state]);
+      exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n", p->pid, cnt, pp->pid, pp->name,
+                proc_stat[pp->state]);
       cnt++;
       pp->parent = initproc;
       // we should wake up init here, but that would require
@@ -309,7 +304,8 @@ void reparent(struct proc *p) {
 void exit(int status) {
   struct proc *p = myproc();
 
-  exit_info("proc %d exit, parent pid %d, name %s, state %s\n", p->pid, p->parent->pid, p->parent->name, proc_stat[p->parent->state]);
+  exit_info("proc %d exit, parent pid %d, name %s, state %s\n", p->pid, p->parent->pid, p->parent->name,
+            proc_stat[p->parent->state]);
   if (p == initproc) panic("init exiting");
 
   // Close all open files.
