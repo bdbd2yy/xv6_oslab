@@ -15,6 +15,15 @@ struct proc *initproc;
 int nextpid = 1;
 struct spinlock pid_lock;
 
+// enum procstate { UNUSED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+const char *proc_stat[] = {
+  "unused",
+  "sleep",
+  "runble",
+  "run",
+  "zombie"
+};
+
 extern void forkret(void);
 static void wakeup1(struct proc *chan);
 static void freeproc(struct proc *p);
@@ -271,6 +280,7 @@ int fork(void) {
 // Caller must hold p->lock.
 void reparent(struct proc *p) {
   struct proc *pp;
+  int cnt = 0;
 
   for (pp = proc; pp < &proc[NPROC]; pp++) {
     // this code uses pp->parent without holding pp->lock.
@@ -281,6 +291,8 @@ void reparent(struct proc *p) {
       // pp->parent can't change between the check and the acquire()
       // because only the parent changes it, and we're the parent.
       acquire(&pp->lock);
+      exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n", p->pid, cnt, pp->pid, pp->name, proc_stat[pp->state]);
+      cnt++;
       pp->parent = initproc;
       // we should wake up init here, but that would require
       // initproc->lock, which would be a deadlock, since we hold
@@ -297,6 +309,7 @@ void reparent(struct proc *p) {
 void exit(int status) {
   struct proc *p = myproc();
 
+  exit_info("proc %d exit, parent pid %d, name %s, state %s\n", p->pid, p->parent->pid, p->parent->name, proc_stat[p->parent->state]);
   if (p == initproc) panic("init exiting");
 
   // Close all open files.
