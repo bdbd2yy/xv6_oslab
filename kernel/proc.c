@@ -100,6 +100,12 @@ static struct proc *allocproc(void) {
 found:
   p->pid = allocpid();
 
+  // approved, approved, approved!
+  p->seccomp_mask = ~0UL;
+
+  // no limit by default
+  p->maxsoncnt = NPROC;
+
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
     release(&p->lock);
@@ -233,6 +239,11 @@ int fork(void) {
   struct proc *np;
   struct proc *p = myproc();
 
+  if (p->soncnt >= p->maxsoncnt) {
+    return -1;
+  }
+  p->soncnt++;
+
   // Allocate process.
   if ((np = allocproc()) == 0) {
     return -1;
@@ -247,6 +258,10 @@ int fork(void) {
   np->sz = p->sz;
 
   np->parent = p;
+
+  // inherit whitelist and resouce limit
+  np->seccomp_mask = p->seccomp_mask;
+  np->maxsoncnt = p->maxsoncnt;
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -389,6 +404,7 @@ int wait(uint64 addr, int flag) {
         if (np->state == ZOMBIE) {
           // Found one.
           pid = np->pid;
+          p->soncnt--;
           if (addr != 0 && copyout(p->pagetable, addr, (char *)&np->xstate, sizeof(np->xstate)) < 0) {
             release(&np->lock);
             release(&p->lock);
@@ -631,4 +647,35 @@ void procdump(void) {
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+int seccomp_ctl(int op, uint64 arg) {
+  struct proc *p;
+  p = myproc();
+  if (op == 0) {
+    acquire(&p->lock);
+    if (arg == 0) {
+      p->seccomp_mask = ~0UL;
+    } else {
+      p->seccomp_mask = arg;
+    }
+    release(&p->lock);
+  } else if (op == 1) {
+    acquire(&p->lock);
+    p->maxsoncnt = arg;
+    release(&p->lock);
+  }
+  return 0;
+}
+
+int seccomp_getlog(uint64 *buf, int *len) {
+  struct proc *p;
+  p = myproc();
+  acquire(&p->lock);
+  for (int i = 0; i < p->logcnt; i++) {
+    buf[i] = p->logbuf[i];
+  }
+  *len = p->logcnt;
+  release(&p->lock);
+  return 0;
 }
