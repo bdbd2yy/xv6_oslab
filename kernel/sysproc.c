@@ -109,3 +109,37 @@ uint64 sys_yield(void) {
   yield();
   return 0;
 }
+
+// why you need to write the declaration like uint64 func(void)? See the type of syscalls in syscall.c
+// the return value will be set to a0 red in the syscall()
+uint64 sys_seccomp_ctl(void) {
+  int op;
+  uint64 a;
+  if (argint(0, &op) < 0) return -1;
+  if (argaddr(1, &a) < 0) return -1;
+  seccomp_ctl(op, a);
+  return 0;
+}
+
+uint64 sys_seccomp_getlog(void) {
+  struct proc *p = myproc();
+  uint64 user_buf;
+  int user_len;
+  uint64 kernel_buf[32];
+  int max_len;
+  int actual_len;
+  p = myproc();
+  // get user-space addresses of two args
+  if (argaddr(0, &user_buf) || argint(1, &user_len)) return -1;
+
+  if (copyin(p->pagetable, (char *)&max_len, user_len, sizeof(max_len)) < 0) return -1;
+  if (max_len < 0 || max_len > 32) {
+    return -1;
+  }
+  actual_len = max_len;
+
+  if (seccomp_getlog(kernel_buf, &actual_len) < 0) return -1;
+  if (copyout(p->pagetable, user_buf, (char *)kernel_buf, actual_len * sizeof(uint64)) < 0) return -1;
+  if (copyout(p->pagetable, user_len, (char *)&actual_len, sizeof(actual_len)) < 0) return -1;
+  return 0;
+}
