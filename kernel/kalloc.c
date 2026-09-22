@@ -82,6 +82,24 @@ kfree(void *pa)
   pop_off();
 }
 
+void *steal_page(int cid) {
+  for (int i = 0; i < NCPU; i++) {
+    if (i == cid) {
+      continue;
+    }
+    acquire(&kmems[i].lock);
+    if (kmems[i].freelist) {
+      struct run *r = kmems[i].freelist;
+      kmems[i].freelist = r->next;
+      release(&kmems[i].lock);
+      memset((char*)r, 5, PGSIZE); // fill with junk
+      return r;
+    }
+    release(&kmems[i].lock);
+  }
+  return 0;
+}
+
 // Allocate one 4096-byte page of physical memory.
 // Returns a pointer that the kernel can use.
 // Returns 0 if the memory cannot be allocated.
@@ -97,9 +115,12 @@ kalloc(void)
   if(r)
     kmems[cid].freelist = r->next;
   release(&kmems[cid].lock);
-  pop_off();
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
+  if(r == 0) {
+    r = steal_page(cid);
+  }
+  pop_off();
   return (void*)r;
 }
