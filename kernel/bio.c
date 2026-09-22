@@ -23,14 +23,18 @@
 #include "fs.h"
 #include "buf.h"
 
-struct {
+struct bcache_bucket {
   struct spinlock lock;
+  struct buf head;
+};
+
+struct {
   struct buf buf[NBUF];
 
   // Linked list of all buffers, through prev/next.
   // Sorted by how recently the buffer was used.
   // head.next is most recent, head.prev is least.
-  struct buf head;
+  struct bcache_bucket hashbucket[NBUCKETS];
 } bcache;
 
 void
@@ -38,17 +42,20 @@ binit(void)
 {
   struct buf *b;
 
-  initlock(&bcache.lock, "bcache");
+  for (int i = 0; i < NBUCKETS; i++) {
+    initlock(&bcache.hashbucket[i].lock, "bcache");
 
-  // Create linked list of buffers
-  bcache.head.prev = &bcache.head;
-  bcache.head.next = &bcache.head;
+    // Create linked list of buffers
+    bcache.hashbucket[i].head.prev = &bcache.hashbucket[i].head;
+    bcache.hashbucket[i].head.next = &bcache.hashbucket[i].head;
+  }
   for(b = bcache.buf; b < bcache.buf+NBUF; b++){
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
+    int i = (b - bcache.buf) % NBUCKETS;
+    b->next = bcache.hashbucket[i].head.next;
+    b->prev = &bcache.hashbucket[i].head;
     initsleeplock(&b->lock, "buffer");
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+    bcache.hashbucket[i].head.next->prev = b;
+    bcache.hashbucket[i].head.next = b;
   }
 }
 
@@ -60,13 +67,15 @@ bget(uint dev, uint blockno)
 {
   struct buf *b;
 
-  acquire(&bcache.lock);
+  int i = blockno % NBUCKETS;
+
+  acquire(&bcache.hashbucket[i].lock);
 
   // Is the block already cached?
-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
+  for(b = bcache.hashbucket[i].head.next; b != &bcache.hashbucket[i].head; b = b->next){
     if(b->dev == dev && b->blockno == blockno){
       b->refcnt++;
-      release(&bcache.lock);
+      release(&bcache.hashbucket[i].lock);
       acquiresleep(&b->lock);
       return b;
     }
@@ -74,16 +83,81 @@ bget(uint dev, uint blockno)
 
   // Not cached.
   // Recycle the least recently used (LRU) unused buffer.
-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
+  for(b = bcache.hashbucket[i].head.prev; b != &bcache.hashbucket[i].head; b = b->prev){
     if(b->refcnt == 0) {
       b->dev = dev;
       b->blockno = blockno;
       b->valid = 0;
       b->refcnt = 1;
-      release(&bcache.lock);
+      release(&bcache.hashbucket[i].lock);
       acquiresleep(&b->lock);
       return b;
     }
+  }
+  // firstly release the original hashbucket[i]'s lock
+  release(&bcache.hashbucket[i].lock);
+  // buffer stealing
+  for (int j = 0; j < NBUCKETS; j++) {
+    if (j == i) {
+      continue;
+    }
+    // i need your lock when accessing the hashbucket[j]
+    // Attention: there is a dead lock risk
+    // You need to ensure that the acquiring of the two lock in some way of order
+    int first = i < j? i: j;
+    int second = i < j? j: i;
+    // Always acquire the low number of hashbucket's lock
+    acquire(&bcache.hashbucket[first].lock);
+    acquire(&bcache.hashbucket[second].lock);
+    // check if the block was loaded or there is free buffer can be victim during the period when the lock of hashbucket[i] is released
+    for(b = bcache.hashbucket[i].head.prev; b != &bcache.hashbucket[i].head; b = b->prev){
+      if(b->dev == dev && b->blockno == blockno) {
+        b->refcnt++;
+        release(&bcache.hashbucket[second].lock);
+        release(&bcache.hashbucket[first].lock);
+        acquiresleep(&b->lock);
+        return b;
+      }
+      if(b->refcnt == 0) {
+        b->dev = dev;
+        b->blockno = blockno;
+        b->valid = 0;
+        b->refcnt = 1;
+        release(&bcache.hashbucket[second].lock);
+        release(&bcache.hashbucket[first].lock);
+        acquiresleep(&b->lock);
+        return b;
+      }
+    }
+    // try to steal buffer from hashbucket[j]
+    for(b = bcache.hashbucket[j].head.prev; b != &bcache.hashbucket[j].head; b = b->prev){
+      if(b->refcnt == 0) {
+        // you are the victim in hashbucket[j]
+        b->dev = dev;
+        b->blockno = blockno;
+        b->valid = 0;
+        b->refcnt = 1;
+
+        // release your relationship in the hashbucket[j]
+        b->next->prev = b->prev;
+        b->prev->next = b->next;
+
+        // establish new relationship in the hashbucket[i]
+        b->next = bcache.hashbucket[i].head.next;
+        b->prev = &bcache.hashbucket[i].head;
+        bcache.hashbucket[i].head.next->prev = b;
+        bcache.hashbucket[i].head.next = b;
+
+        // releasing locks reversely is a good programming practice
+        release(&bcache.hashbucket[second].lock);
+        release(&bcache.hashbucket[first].lock);
+        acquiresleep(&b->lock);
+        return b;
+      }
+    }
+    // steal nothing in hashbucket[j], give the lock back
+    release(&bcache.hashbucket[second].lock);
+    release(&bcache.hashbucket[first].lock);
   }
   panic("bget: no buffers");
 }
@@ -116,38 +190,41 @@ bwrite(struct buf *b)
 void
 brelse(struct buf *b)
 {
+  int i = b->blockno % NBUCKETS;
   if(!holdingsleep(&b->lock))
     panic("brelse");
 
   releasesleep(&b->lock);
 
-  acquire(&bcache.lock);
+  acquire(&bcache.hashbucket[i].lock);
   b->refcnt--;
   if (b->refcnt == 0) {
     // no one is waiting for it.
     b->next->prev = b->prev;
     b->prev->next = b->next;
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+    b->next = bcache.hashbucket[i].head.next;
+    b->prev = &bcache.hashbucket[i].head;
+    bcache.hashbucket[i].head.next->prev = b;
+    bcache.hashbucket[i].head.next = b;
   }
   
-  release(&bcache.lock);
+  release(&bcache.hashbucket[i].lock);
 }
 
 void
 bpin(struct buf *b) {
-  acquire(&bcache.lock);
+  int i = b->blockno % NBUCKETS;
+  acquire(&bcache.hashbucket[i].lock);
   b->refcnt++;
-  release(&bcache.lock);
+  release(&bcache.hashbucket[i].lock);
 }
 
 void
 bunpin(struct buf *b) {
-  acquire(&bcache.lock);
+  int i = b->blockno % NBUCKETS;
+  acquire(&bcache.hashbucket[i].lock);
   b->refcnt--;
-  release(&bcache.lock);
+  release(&bcache.hashbucket[i].lock);
 }
 
 
