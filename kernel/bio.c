@@ -37,6 +37,10 @@ struct {
   struct bcache_bucket hashbucket[NBUCKETS];
 } bcache;
 
+static void list_remove(struct buf *b);
+static void list_insert_head(int btno, struct buf *b);
+static struct buf* bsteal(uint dev, uint blockno);
+
 void
 binit(void)
 {
@@ -97,67 +101,10 @@ bget(uint dev, uint blockno)
   // firstly release the original hashbucket[i]'s lock
   release(&bcache.hashbucket[i].lock);
   // buffer stealing
-  for (int j = 0; j < NBUCKETS; j++) {
-    if (j == i) {
-      continue;
-    }
-    // i need your lock when accessing the hashbucket[j]
-    // Attention: there is a dead lock risk
-    // You need to ensure that the acquiring of the two lock in some way of order
-    int first = i < j? i: j;
-    int second = i < j? j: i;
-    // Always acquire the low number of hashbucket's lock
-    acquire(&bcache.hashbucket[first].lock);
-    acquire(&bcache.hashbucket[second].lock);
-    // check if the block was loaded or there is free buffer can be victim during the period when the lock of hashbucket[i] is released
-    for(b = bcache.hashbucket[i].head.prev; b != &bcache.hashbucket[i].head; b = b->prev){
-      if(b->dev == dev && b->blockno == blockno) {
-        b->refcnt++;
-        release(&bcache.hashbucket[second].lock);
-        release(&bcache.hashbucket[first].lock);
-        acquiresleep(&b->lock);
-        return b;
-      }
-      if(b->refcnt == 0) {
-        b->dev = dev;
-        b->blockno = blockno;
-        b->valid = 0;
-        b->refcnt = 1;
-        release(&bcache.hashbucket[second].lock);
-        release(&bcache.hashbucket[first].lock);
-        acquiresleep(&b->lock);
-        return b;
-      }
-    }
-    // try to steal buffer from hashbucket[j]
-    for(b = bcache.hashbucket[j].head.prev; b != &bcache.hashbucket[j].head; b = b->prev){
-      if(b->refcnt == 0) {
-        // you are the victim in hashbucket[j]
-        b->dev = dev;
-        b->blockno = blockno;
-        b->valid = 0;
-        b->refcnt = 1;
-
-        // release your relationship in the hashbucket[j]
-        b->next->prev = b->prev;
-        b->prev->next = b->next;
-
-        // establish new relationship in the hashbucket[i]
-        b->next = bcache.hashbucket[i].head.next;
-        b->prev = &bcache.hashbucket[i].head;
-        bcache.hashbucket[i].head.next->prev = b;
-        bcache.hashbucket[i].head.next = b;
-
-        // releasing locks reversely is a good programming practice
-        release(&bcache.hashbucket[second].lock);
-        release(&bcache.hashbucket[first].lock);
-        acquiresleep(&b->lock);
-        return b;
-      }
-    }
-    // steal nothing in hashbucket[j], give the lock back
-    release(&bcache.hashbucket[second].lock);
-    release(&bcache.hashbucket[first].lock);
+  b = bsteal(dev, blockno);
+  if (b) {
+    acquiresleep(&b->lock);
+    return b;
   }
   panic("bget: no buffers");
 }
@@ -200,12 +147,8 @@ brelse(struct buf *b)
   b->refcnt--;
   if (b->refcnt == 0) {
     // no one is waiting for it.
-    b->next->prev = b->prev;
-    b->prev->next = b->next;
-    b->next = bcache.hashbucket[i].head.next;
-    b->prev = &bcache.hashbucket[i].head;
-    bcache.hashbucket[i].head.next->prev = b;
-    bcache.hashbucket[i].head.next = b;
+    list_remove(b);
+    list_insert_head(i, b);
   }
   
   release(&bcache.hashbucket[i].lock);
@@ -227,4 +170,79 @@ bunpin(struct buf *b) {
   release(&bcache.hashbucket[i].lock);
 }
 
+static void list_remove(struct buf *b) {
+  b->next->prev = b->prev;
+  b->prev->next = b->next;
+}
 
+static void list_insert_head(int btno, struct buf *b) {
+  b->next = bcache.hashbucket[btno].head.next;
+  b->prev = &bcache.hashbucket[btno].head;
+  bcache.hashbucket[btno].head.next->prev = b;
+  bcache.hashbucket[btno].head.next = b;
+}
+
+static struct buf *bsteal(uint dev, uint blockno) {
+  int i = blockno % NBUCKETS;
+  struct buf *b;
+
+  for (int j = 0; j < NBUCKETS; j++) {
+    if (j == i) {
+      continue;
+    }
+    // i need your lock when accessing the hashbucket[j]
+    // Attention: there is a dead lock risk
+    // You need to ensure that the acquiring of the two lock in some way of
+    // order
+    int first = i < j ? i : j;
+    int second = i < j ? j : i;
+    // Always acquire the low number of hashbucket's lock
+    acquire(&bcache.hashbucket[first].lock);
+    acquire(&bcache.hashbucket[second].lock);
+    // check if the block was loaded or there is free buffer can be victim
+    // during the period when the lock of hashbucket[i] is released
+    for (b = bcache.hashbucket[i].head.prev; b != &bcache.hashbucket[i].head;
+         b = b->prev) {
+      if (b->dev == dev && b->blockno == blockno) {
+        b->refcnt++;
+        release(&bcache.hashbucket[second].lock);
+        release(&bcache.hashbucket[first].lock);
+        return b;
+      }
+      if (b->refcnt == 0) {
+        b->dev = dev;
+        b->blockno = blockno;
+        b->valid = 0;
+        b->refcnt = 1;
+        release(&bcache.hashbucket[second].lock);
+        release(&bcache.hashbucket[first].lock);
+        return b;
+      }
+    }
+    // try to steal buffer from hashbucket[j]
+    for (b = bcache.hashbucket[j].head.prev; b != &bcache.hashbucket[j].head;
+         b = b->prev) {
+      if (b->refcnt == 0) {
+        // you are the victim in hashbucket[j]
+        b->dev = dev;
+        b->blockno = blockno;
+        b->valid = 0;
+        b->refcnt = 1;
+
+        // release your relationship in the hashbucket[j]
+        list_remove(b);
+
+        // establish new relationship in the hashbucket[i]
+        list_insert_head(i, b);
+
+        // releasing locks reversely is a good programming practice
+        release(&bcache.hashbucket[second].lock);
+        release(&bcache.hashbucket[first].lock);
+        return b;
+      }
+    }
+    release(&bcache.hashbucket[second].lock);
+    release(&bcache.hashbucket[first].lock);
+  }
+  return 0;
+}
