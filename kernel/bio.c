@@ -1,6 +1,6 @@
 // Buffer cache.
 //
-// The buffer cache is a linked list of buf structures holding
+// The buffer cache uses per-bucket circular lists of buf structures holding
 // cached copies of disk block contents.  Caching disk blocks
 // in memory reduces the number of disk reads and also provides
 // a synchronization point for disk blocks used by multiple processes.
@@ -26,20 +26,21 @@
 struct bcache_bucket {
   struct spinlock lock;
   struct buf head;
+  struct buf *hand; // Next node to inspect in the circular CLOCK scan.
 };
 
 struct {
   struct buf buf[NBUF];
 
-  // Linked list of all buffers, through prev/next.
-  // Sorted by how recently the buffer was used.
-  // head.next is most recent, head.prev is least.
+  // Per-bucket circular lists of buffers, through prev/next.
+  // Each bucket uses CLOCK to select an idle buffer for replacement.
   struct bcache_bucket hashbucket[NBUCKETS];
 } bcache;
 
 static void list_remove(struct buf *b);
 static void list_insert_head(int btno, struct buf *b);
 static struct buf* bsteal(uint dev, uint blockno);
+static struct buf *find_victim_locked(struct bcache_bucket *bucket);
 
 void
 binit(void)
@@ -52,9 +53,11 @@ binit(void)
     // Create linked list of buffers
     bcache.hashbucket[i].head.prev = &bcache.hashbucket[i].head;
     bcache.hashbucket[i].head.next = &bcache.hashbucket[i].head;
+    bcache.hashbucket[i].hand = &bcache.hashbucket[i].head;
   }
   for(b = bcache.buf; b < bcache.buf+NBUF; b++){
     int i = (b - bcache.buf) % NBUCKETS;
+    b->referenced = 0;
     b->next = bcache.hashbucket[i].head.next;
     b->prev = &bcache.hashbucket[i].head;
     initsleeplock(&b->lock, "buffer");
@@ -79,32 +82,33 @@ bget(uint dev, uint blockno)
   for(b = bcache.hashbucket[i].head.next; b != &bcache.hashbucket[i].head; b = b->next){
     if(b->dev == dev && b->blockno == blockno){
       b->refcnt++;
+      b->referenced = 1;
       release(&bcache.hashbucket[i].lock);
       acquiresleep(&b->lock);
       return b;
     }
   }
 
-  // Not cached.
-  // Recycle the least recently used (LRU) unused buffer.
-  for(b = bcache.hashbucket[i].head.prev; b != &bcache.hashbucket[i].head; b = b->prev){
-    if(b->refcnt == 0) {
-      b->dev = dev;
-      b->blockno = blockno;
-      b->valid = 0;
-      b->refcnt = 1;
-      release(&bcache.hashbucket[i].lock);
-      acquiresleep(&b->lock);
-      return b;
-    }
+  // Use CLOCK to choose an idle victim.
+  struct buf *victim = find_victim_locked(&bcache.hashbucket[i]);
+  if (victim) {
+    victim->dev = dev;
+    victim->blockno = blockno;
+    victim->valid = 0;
+    victim->refcnt = 1;
+    victim->referenced = 1;
+    release(&bcache.hashbucket[i].lock);
+    acquiresleep(&victim->lock);
+    return victim;
   }
+
   // firstly release the original hashbucket[i]'s lock
   release(&bcache.hashbucket[i].lock);
   // buffer stealing
-  b = bsteal(dev, blockno);
-  if (b) {
-    acquiresleep(&b->lock);
-    return b;
+  victim = bsteal(dev, blockno);
+  if (victim) {
+    acquiresleep(&victim->lock);
+    return victim;
   }
   panic("bget: no buffers");
 }
@@ -133,7 +137,6 @@ bwrite(struct buf *b)
 }
 
 // Release a locked buffer.
-// Move to the head of the most-recently-used list.
 void
 brelse(struct buf *b)
 {
@@ -145,12 +148,6 @@ brelse(struct buf *b)
 
   acquire(&bcache.hashbucket[i].lock);
   b->refcnt--;
-  if (b->refcnt == 0) {
-    // no one is waiting for it.
-    list_remove(b);
-    list_insert_head(i, b);
-  }
-  
   release(&bcache.hashbucket[i].lock);
 }
 
@@ -190,59 +187,90 @@ static struct buf *bsteal(uint dev, uint blockno) {
     if (j == i) {
       continue;
     }
-    // i need your lock when accessing the hashbucket[j]
     // Attention: there is a dead lock risk
     // You need to ensure that the acquiring of the two lock in some way of
     // order
     int first = i < j ? i : j;
     int second = i < j ? j : i;
-    // Always acquire the low number of hashbucket's lock
+    // Always acquire the low number of hashbucket's lock to avoid dead lock
     acquire(&bcache.hashbucket[first].lock);
     acquire(&bcache.hashbucket[second].lock);
-    // check if the block was loaded or there is free buffer can be victim
-    // during the period when the lock of hashbucket[i] is released
+    // there is a period when the lock of hashbucket[i] is released
+    // check if the block was loaded
     for (b = bcache.hashbucket[i].head.prev; b != &bcache.hashbucket[i].head;
          b = b->prev) {
       if (b->dev == dev && b->blockno == blockno) {
         b->refcnt++;
-        release(&bcache.hashbucket[second].lock);
-        release(&bcache.hashbucket[first].lock);
-        return b;
-      }
-      if (b->refcnt == 0) {
-        b->dev = dev;
-        b->blockno = blockno;
-        b->valid = 0;
-        b->refcnt = 1;
+        b->referenced = 1;
         release(&bcache.hashbucket[second].lock);
         release(&bcache.hashbucket[first].lock);
         return b;
       }
     }
+    // check if there is free buffer can be victim
+    struct buf *victim = find_victim_locked(&bcache.hashbucket[i]);
+    if (victim) {
+      victim->dev = dev;
+      victim->blockno = blockno;
+      victim->valid = 0;
+      victim->refcnt = 1;
+      victim->referenced = 1;
+      release(&bcache.hashbucket[second].lock);
+      release(&bcache.hashbucket[first].lock);
+      return victim;
+    }
     // try to steal buffer from hashbucket[j]
-    for (b = bcache.hashbucket[j].head.prev; b != &bcache.hashbucket[j].head;
-         b = b->prev) {
-      if (b->refcnt == 0) {
-        // you are the victim in hashbucket[j]
-        b->dev = dev;
-        b->blockno = blockno;
-        b->valid = 0;
-        b->refcnt = 1;
+    victim = find_victim_locked(&bcache.hashbucket[j]);
+    if (victim) {
+      victim->dev = dev;
+      victim->blockno = blockno;
+      victim->valid = 0;
+      victim->refcnt = 1;
+      victim->referenced = 1;
 
-        // release your relationship in the hashbucket[j]
-        list_remove(b);
+      // The CLOCK scan advanced j's hand before returning victim.
+      // Move the buffer from list j to list i.
+      list_remove(victim);
+      list_insert_head(i, victim);
 
-        // establish new relationship in the hashbucket[i]
-        list_insert_head(i, b);
-
-        // releasing locks reversely is a good programming practice
-        release(&bcache.hashbucket[second].lock);
-        release(&bcache.hashbucket[first].lock);
-        return b;
-      }
+      release(&bcache.hashbucket[second].lock);
+      release(&bcache.hashbucket[first].lock);
+      return victim;
     }
     release(&bcache.hashbucket[second].lock);
     release(&bcache.hashbucket[first].lock);
+  }
+  return 0;
+}
+
+// Caller must hold bucket->lock. The hand stays in this bucket even when
+// the returned victim is subsequently moved to another bucket.
+static struct buf *find_victim_locked(struct bcache_bucket *bucket) {
+  // the list is empty
+  if (bucket->head.next == &bucket->head)
+    return 0;
+
+  // One pass clears reference bits; a second can select an idle buffer.
+  // Stop after two passes even if every buffer is in use or pinned.
+  for (int pass = 0; pass < 2; pass++) {
+    struct buf *start = bucket->hand;
+    do {
+      // The hand may point at the sentinel between scans.
+      if (bucket->hand == &bucket->head) {
+        bucket->hand = bucket->head.next;
+        continue;
+      }
+      struct buf *b = bucket->hand;
+      // Advance before returning so removing b cannot move the hand into
+      // another bucket.
+      bucket->hand = b->next;
+
+      if (b->refcnt == 0) {
+        if (b->referenced == 0)
+          return b;
+        b->referenced = 0;
+      }
+    } while (bucket->hand != start);
   }
   return 0;
 }
